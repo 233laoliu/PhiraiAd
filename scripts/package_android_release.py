@@ -19,6 +19,7 @@ import zipfile
 import zlib
 
 from dex_density_dpi import patch_density_dpi, verify_density_dpi
+from dex_touch_input import patch_touch_input, verify_touch_input
 
 
 VIDEO_MARKER = b"PHIRA_REPLICA_VIDEO_ENABLED_FFMPEG_V1\0"
@@ -453,7 +454,7 @@ def main():
                 elif name == "AndroidManifest.xml":
                     content = patch_manifest(content, old_name, args.version_name, args.version_code, args.app_label)
                 elif name == "classes.dex":
-                    content = patch_density_dpi(content)
+                    content = patch_touch_input(patch_density_dpi(content))
                 elif name == "lib/arm64-v8a/libphira.so":
                     content = lib
                     seen.add(name)
@@ -490,6 +491,7 @@ def main():
                 if z.read(name) != expected:
                     raise ValueError(f"Final APK asset validation failed: {name}")
             verify_density_dpi(z.read("classes.dex"))
+            verify_touch_input(z.read("classes.dex"))
             if z.read("lib/arm64-v8a/libphira.so") != lib:
                 raise ValueError("Final APK does not contain the intended native library")
             if z.read("lib/arm64-v8a/libc++_shared.so") != cxx:
@@ -504,7 +506,7 @@ def main():
                 expected_changes = {"AndroidManifest.xml", "lib/arm64-v8a/libphira.so",
                                     "lib/arm64-v8a/libc++_shared.so", "classes.dex"}
                 expected_changes.update(asset_replacements)
-                if z.read("classes.dex") != patch_density_dpi(original.read("classes.dex")):
+                if z.read("classes.dex") != patch_touch_input(patch_density_dpi(original.read("classes.dex"))):
                     raise ValueError("Unexpected DEX changes")
                 if any(original.read(n) != z.read(n) for n in names - expected_changes):
                     raise ValueError("Final APK unexpectedly changed an Android shell/resource file")

@@ -234,6 +234,107 @@ fn update_active_finger(fingers: &mut HashMap<u64, Vec2>, id: u64, phase: TouchP
     }
 }
 
+/// Merge frame snapshots and raw events without losing the latest position.
+/// Down remains a click through subsequent moves, but an explicit release ends
+/// that contact. Finite platform timestamps prevent an older event from
+/// rewinding a newer snapshot; synthetic mouse snapshots have no timestamp.
+fn merge_official_touch(touches: &mut HashMap<u64, Touch>, event: Touch) {
+    let Some(previous) = touches.get_mut(&event.id) else {
+        touches.insert(event.id, event);
+        return;
+    };
+    let previous_live = matches!(previous.phase, TouchPhase::Started | TouchPhase::Moved | TouchPhase::Stationary);
+    let event_live = matches!(event.phase, TouchPhase::Started | TouchPhase::Moved | TouchPhase::Stationary);
+    if previous.time.is_finite() && event.time.is_finite() && previous.time > event.time {
+        if event.phase == TouchPhase::Started && previous_live {
+            previous.phase = TouchPhase::Started;
+        }
+        return;
+    }
+    let started = event.phase == TouchPhase::Started || (previous.phase == TouchPhase::Started && previous_live && event_live);
+    *previous = event;
+    if started {
+        previous.phase = TouchPhase::Started;
+    }
+}
+
+/// Preserve the existing quick-click behavior when Down and Up share a frame.
+/// These samples are only for click judgement, never the persistent finger list
+/// or Flick velocity/rebinding. A terminal snapshot alone is not a new click.
+fn released_frame_clicks(touches: &HashMap<u64, Touch>, started_ids: &HashSet<u64>) -> Vec<Touch> {
+    touches
+        .values()
+        .filter(|touch| started_ids.contains(&touch.id) && touch.phase == TouchPhase::Ended)
+        .map(|touch| {
+            let mut click = touch.clone();
+            click.phase = TouchPhase::Started;
+            click
+        })
+        .collect()
+}
+
+/// Noise latches follow contacts, not pointer IDs reused by a later Down.
+/// Replay only completed quick-click contacts here; normal held gestures keep
+/// the existing one-position-per-frame block-area check.
+fn blocked_released_clicks(
+    clicks: &[Touch],
+    samples: &[Touch],
+    previously_blocked: &HashSet<u64>,
+    mut blocked_at: impl FnMut(Vec2) -> bool,
+) -> HashSet<u64> {
+    let ids: HashSet<_> = clicks.iter().map(|touch| touch.id).collect();
+    let mut contact_blocked = previously_blocked.clone();
+    let mut rejected = HashSet::new();
+    for sample in samples.iter().filter(|sample| ids.contains(&sample.id)) {
+        if sample.phase == TouchPhase::Started {
+            contact_blocked.remove(&sample.id);
+            rejected.remove(&sample.id);
+        }
+        if blocked_at(sample.position) {
+            contact_blocked.insert(sample.id);
+        }
+        if matches!(sample.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            if contact_blocked.remove(&sample.id) || sample.phase == TouchPhase::Cancelled {
+                rejected.insert(sample.id);
+            }
+        }
+    }
+    // A terminal snapshot may be newer than every replayed raw sample.
+    for click in clicks {
+        if contact_blocked.contains(&click.id) || blocked_at(click.position) {
+            rejected.insert(click.id);
+        }
+    }
+    rejected
+}
+
+fn update_noise_contact(state: &mut NoiseAreaState, id: u64, phase: TouchPhase) {
+    if matches!(phase, TouchPhase::Started | TouchPhase::Ended | TouchPhase::Cancelled) {
+        state.release_finger(id);
+    }
+}
+
+fn noise_touch_positions(
+    touches: &HashMap<u64, Touch>,
+    extra_flick_touches: &HashMap<u64, Touch>,
+    active: &HashMap<u64, Vec2>,
+    live_ids: &HashSet<u64>,
+    aspect: f32,
+) -> Vec<(u64, Vec2)> {
+    let mut result: Vec<_> = touches
+        .values()
+        .filter(|touch| !extra_flick_touches.contains_key(&touch.id))
+        .chain(extra_flick_touches.values())
+        .filter(|touch| !matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled))
+        .map(|touch| (touch.id, touch.position))
+        .chain(active.iter().filter(|(id, _)| !touches.contains_key(id) && !extra_flick_touches.contains_key(id)).map(|(&id, &point)| (id, point)))
+        .filter(|(id, _)| live_ids.contains(id))
+        .map(|(id, point)| (id, vec2(point.x * 5. * aspect, -point.y * 5. * aspect)))
+        .collect();
+    result.sort_by_key(|(id, _)| *id);
+    result
+}
+
 #[inline]
 fn remember_finger(order: &mut Vec<u64>, id: u64) {
     if !order.contains(&id) {
@@ -286,6 +387,35 @@ fn complete_finger_snapshots(touches: &mut HashMap<u64, Touch>, active: &HashMap
             }
         }
     }
+}
+
+fn reconcile_official_fingers(
+    touches: &mut HashMap<u64, Touch>,
+    active: &mut HashMap<u64, Vec2>,
+    order: &mut Vec<u64>,
+    trackers: &mut HashMap<u64, FlickTracker>,
+    complete_snapshots: bool,
+    mut removed_ids: Option<&mut Vec<u64>>,
+    synthesized_ids: Option<&mut Vec<u64>>,
+) -> HashSet<u64> {
+    // Absence is not a release; an explicit terminal snapshot/event is.
+    for touch in touches.values() {
+        update_active_finger(active, touch.id, touch.phase, touch.position);
+        if matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            forget_finger(order, touch.id);
+            if trackers.remove(&touch.id).is_some() {
+                if let Some(ids) = removed_ids.as_deref_mut() {
+                    ids.push(touch.id);
+                }
+            }
+        }
+    }
+    if complete_snapshots {
+        complete_finger_snapshots(touches, active, synthesized_ids);
+    }
+    let live_ids = active.keys().copied().collect();
+    append_missing_fingers(order, &live_ids);
+    live_ids
 }
 
 fn rebind_official_flick_tracker(
@@ -1388,8 +1518,8 @@ impl Judge {
         // A transformed MotionEvent fallback needed only by a mixed
         // Phigros-Flick/Phira-other setup. Keep it out of the passive touch
         // list so changing the Flick engine cannot change Phira Drag/Hold.
-        let mut extra_flick_touches = HashMap::new();
-        if persistent_input {
+        let mut extra_flick_touches = if flick_official && !persistent_input { touches.clone() } else { HashMap::new() };
+        if any_official {
             // Seed and refresh positions from the persistent snapshot, but do
             // not use absence from one frame as a release.  Explicit terminal
             // events below and lifecycle-boundary cleanup are authoritative.
@@ -1423,6 +1553,10 @@ impl Judge {
         let mut debug_tracker_rebound_ids = Vec::new();
         let mut debug_tracker_removed_ids = Vec::new();
         let mut debug_synthesized_stationary_ids = Vec::new();
+        let mut released_clicks = Vec::new();
+        let check_quick_noise = res.config.noise_area.enabled && !chart.extra.block_areas.is_empty();
+        let noise_before = check_quick_noise.then(|| self.noise_state.blocked_ids.clone());
+        let mut noise_samples = Vec::new();
         {
             fn to_phira_tracker_point(Vec2 { x, y }: Vec2) -> Point {
                 Point::new(x / screen_width() * 2. - 1., y / screen_height() * 2. - 1.)
@@ -1431,6 +1565,7 @@ impl Judge {
             let mut tracker_time = self.last_time;
             let official_frame_time = self.official_tracker_clock;
             let mut official_started = HashSet::new();
+            let mut frame_started = HashSet::new();
             let event_transform = Self::chart_touch_transform(flip_x, res.auto_flip_y, res.practice_view);
             for Touch {
                 id,
@@ -1450,6 +1585,10 @@ impl Judge {
                 };
                 event_transform(&mut transformed_touch);
                 let judge_point = transformed_touch.position;
+                if check_quick_noise {
+                    noise_samples.push(transformed_touch.clone());
+                }
+                update_noise_contact(&mut self.noise_state, id, phase);
                 if touch_debug_enabled {
                     let mapped_time = if time.is_infinite() { t } else { t - (uptime - time) * spd };
                     let phigros_point = to_phigros_motion_point(motion_position(judge_point), phigros_unit);
@@ -1491,11 +1630,18 @@ impl Judge {
                         TouchPhase::Ended | TouchPhase::Cancelled => forget_finger(&mut self.finger_order, id),
                     }
                 }
-                if persistent_input {
-                    update_active_finger(&mut self.active_fingers, id, phase, judge_point);
+                if any_official {
+                    if persistent_input {
+                        merge_official_touch(&mut touches, transformed_touch.clone());
+                    } else {
+                        merge_official_touch(&mut extra_flick_touches, transformed_touch.clone());
+                    }
                 }
                 match phase {
                     TouchPhase::Started => {
+                        if any_official {
+                            frame_started.insert(id);
+                        }
                         let tracker_start = if flick_official { official_frame_time } else { sample_time };
                         self.trackers
                             .insert(
@@ -1514,9 +1660,7 @@ impl Judge {
                         if flick_official {
                             official_started.insert(id);
                         }
-                        if persistent_input {
-                            touches.entry(id).or_insert(transformed_touch).phase = TouchPhase::Started;
-                        } else {
+                        if !persistent_input {
                             // Keep the original Phira fallback path byte-for-byte
                             // equivalent when macroquad has no snapshot entry.
                             touches
@@ -1536,15 +1680,13 @@ impl Judge {
                                 tracker.push(sample_time, tracker_point);
                             }
                         }
-                        if flick_official && !touches.contains_key(&id) {
-                            if persistent_input {
-                                touches.insert(id, transformed_touch);
-                            } else {
-                                extra_flick_touches.insert(id, transformed_touch);
-                            }
-                        }
                     }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
+                        if !persistent_input && phase == TouchPhase::Cancelled {
+                            // Phira's quick Down marker must not turn a system
+                            // cancellation into a click or one more held frame.
+                            merge_official_touch(&mut touches, transformed_touch);
+                        }
                         if self.trackers.remove(&id).is_some() && touch_debug_enabled {
                             debug_tracker_removed_ids.push(id);
                         }
@@ -1554,18 +1696,25 @@ impl Judge {
             // Complete retained fingers before velocity updates, so a missing
             // snapshot still supplies this frame's zero-displacement sample.
             // Explicit Ended/Cancelled events have already removed the finger.
-            if other_official && flick_official {
-                complete_finger_snapshots(&mut touches, &self.active_fingers, touch_debug_enabled.then_some(&mut debug_synthesized_stationary_ids));
-            }
             if any_official {
-                append_missing_fingers(&mut self.finger_order, &active_snapshot_ids);
+                let frame_touches = if persistent_input { &mut touches } else { &mut extra_flick_touches };
+                noise_live_ids = reconcile_official_fingers(
+                    frame_touches,
+                    &mut self.active_fingers,
+                    &mut self.finger_order,
+                    &mut self.trackers,
+                    flick_official,
+                    touch_debug_enabled.then_some(&mut debug_tracker_removed_ids),
+                    touch_debug_enabled.then_some(&mut debug_synthesized_stationary_ids),
+                );
+                released_clicks = released_frame_clicks(frame_touches, &frame_started);
             }
             if flick_official {
                 // Recreate a missing official tracker at the latest position.
                 // The current frame is treated as its zero-velocity baseline,
                 // so recovery can never manufacture a Flick from the gap.
                 for id in self.finger_order.clone() {
-                    let touch = touches.get(&id).or_else(|| extra_flick_touches.get(&id));
+                    let touch = extra_flick_touches.get(&id).or_else(|| touches.get(&id));
                     let Some(touch) = touch.filter(|touch| matches!(touch.phase, TouchPhase::Started | TouchPhase::Moved | TouchPhase::Stationary))
                     else {
                         continue;
@@ -1597,7 +1746,7 @@ impl Judge {
                     if official_started.contains(&id) {
                         continue;
                     }
-                    let touch = touches.get(&id).or_else(|| extra_flick_touches.get(&id));
+                    let touch = extra_flick_touches.get(&id).or_else(|| touches.get(&id));
                     let Some(touch) = touch.filter(|touch| matches!(touch.phase, TouchPhase::Started | TouchPhase::Moved | TouchPhase::Stationary))
                     else {
                         continue;
@@ -1621,16 +1770,23 @@ impl Judge {
             it
         };
         // Filter after all raw events and persistent snapshots have been merged.
-        let mut noise_touches: Vec<_> = touches
-            .values()
-            .chain(extra_flick_touches.values())
-            .filter(|touch| !matches!(touch.phase, TouchPhase::Ended | TouchPhase::Cancelled))
-            .filter(|touch| noise_live_ids.contains(&touch.id))
-            .map(|touch| (touch.id, vec2(touch.position.x * 5. * res.aspect_ratio, -touch.position.y * 5. * res.aspect_ratio)))
-            .collect();
-        noise_touches.sort_by_key(|(id, _)| *id);
-        noise_touches.dedup_by_key(|(id, _)| *id);
+        let noise_touches = noise_touch_positions(&touches, &extra_flick_touches, &self.active_fingers, &noise_live_ids, res.aspect_ratio);
         chart.update_noise_areas(res);
+        let mut quick_clicks = released_clicks.clone();
+        // Phira already preserves its own quick-click phase in the passive map.
+        quick_clicks.extend(touches.values().filter(|touch| touch.phase == TouchPhase::Started && !noise_live_ids.contains(&touch.id)).cloned());
+        let rejected_clicks = if let Some(before) = noise_before {
+            blocked_released_clicks(&quick_clicks, &noise_samples, &before, |point| {
+                crate::noise_area::blocked(
+                    &chart.extra.block_areas,
+                    vec2(point.x * 5. * res.aspect_ratio, -point.y * 5. * res.aspect_ratio),
+                    t as f32,
+                    res.aspect_ratio,
+                )
+            })
+        } else {
+            HashSet::new()
+        };
         self.noise_state.update(
             &chart.extra.block_areas,
             &noise_touches,
@@ -1639,10 +1795,12 @@ impl Judge {
             res.config.noise_area.enabled,
             get_frame_time(),
         );
-        touches.retain(|id, _| !self.noise_state.is_blocked(*id));
-        extra_flick_touches.retain(|id, _| !self.noise_state.is_blocked(*id));
+        touches.retain(|id, touch| touch.phase != TouchPhase::Cancelled && !self.noise_state.is_blocked(*id) && !rejected_clicks.contains(id));
+        extra_flick_touches.retain(|id, touch| touch.phase != TouchPhase::Cancelled && !self.noise_state.is_blocked(*id) && !rejected_clicks.contains(id));
+        released_clicks.retain(|touch| !self.noise_state.is_blocked(touch.id) && !rejected_clicks.contains(&touch.id));
         let mut event_touch_map = touches.clone();
         event_touch_map.extend(extra_flick_touches);
+        event_touch_map.extend(released_clicks.into_iter().map(|touch| (touch.id, touch)));
         let touches = if any_official {
             drain_touches_in_order(touches, &self.finger_order)
         } else {
@@ -2785,6 +2943,317 @@ mod replica_input_tests {
         assert_eq!(events[1].difference, -0.025);
         assert!(judge.take_report_judgements().is_empty());
         assert_eq!(judge.judgements.borrow().len(), 2);
+    }
+
+    fn input_sample(id: u64, phase: TouchPhase, x: f32, time: f64) -> Touch {
+        Touch { id, phase, position: vec2(x, 0.), time }
+    }
+
+    #[test]
+    fn cancelled_down_is_not_a_released_click() {
+        let mut touches = HashMap::new();
+        merge_official_touch(&mut touches, input_sample(7, TouchPhase::Started, 0., 1.));
+        merge_official_touch(&mut touches, input_sample(7, TouchPhase::Cancelled, 0., 2.));
+        assert!(released_frame_clicks(&touches, &HashSet::from([7])).is_empty());
+    }
+
+    #[test]
+    fn terminal_then_down_reuses_noise_pointer_without_disabling_another_finger() {
+        for terminal in [TouchPhase::Ended, TouchPhase::Cancelled] {
+            let mut state = NoiseAreaState::default();
+            state.blocked_ids.extend([7, 8]);
+            update_noise_contact(&mut state, 7, terminal);
+            update_noise_contact(&mut state, 7, TouchPhase::Started);
+            state.update(&[], &[(7, vec2(1., 0.)), (8, vec2(1., 0.))], 0., 1., true, 0.016);
+            assert!(!state.is_blocked(7));
+            assert!(state.is_blocked(8));
+        }
+    }
+
+    #[test]
+    fn moved_or_stationary_noise_contact_stays_latched_until_real_release() {
+        let mut state = NoiseAreaState::default();
+        state.blocked_ids.insert(7);
+        for phase in [TouchPhase::Moved, TouchPhase::Stationary] {
+            update_noise_contact(&mut state, 7, phase);
+            assert!(state.is_blocked(7));
+        }
+    }
+
+    #[test]
+    fn older_cancellation_does_not_remove_a_newer_contact_snapshot() {
+        let mut touches = HashMap::from([(7, input_sample(7, TouchPhase::Started, 0.7, 3.))]);
+        merge_official_touch(&mut touches, input_sample(7, TouchPhase::Cancelled, 0., 2.));
+        assert_eq!(touches[&7].phase, TouchPhase::Started);
+        assert_eq!(touches[&7].position, vec2(0.7, 0.));
+    }
+
+    #[test]
+    fn quick_click_inside_noise_is_rejected_before_input_map_insertion() {
+        let samples = [input_sample(7, TouchPhase::Started, -0.1, 1.), input_sample(7, TouchPhase::Ended, -0.1, 2.)];
+        let clicks = [input_sample(7, TouchPhase::Started, -0.1, 2.)];
+        assert_eq!(blocked_released_clicks(&clicks, &samples, &HashSet::new(), |p| p.x < 0.), HashSet::from([7]));
+    }
+
+    #[test]
+    fn quick_click_that_enters_then_leaves_noise_stays_rejected() {
+        let samples = [input_sample(7, TouchPhase::Started, 0.1, 1.), input_sample(7, TouchPhase::Moved, -0.1, 2.), input_sample(7, TouchPhase::Ended, 0.2, 3.)];
+        let clicks = [input_sample(7, TouchPhase::Started, 0.2, 3.)];
+        assert_eq!(blocked_released_clicks(&clicks, &samples, &HashSet::new(), |p| p.x < 0.), HashSet::from([7]));
+    }
+
+    #[test]
+    fn quick_click_after_id_reuse_does_not_inherit_previous_noise_latch() {
+        let samples = [input_sample(7, TouchPhase::Ended, -0.1, 1.), input_sample(7, TouchPhase::Started, 0.2, 2.), input_sample(7, TouchPhase::Ended, 0.2, 3.)];
+        let clicks = [input_sample(7, TouchPhase::Started, 0.2, 3.)];
+        assert!(blocked_released_clicks(&clicks, &samples, &HashSet::from([7]), |p| p.x < 0.).is_empty());
+    }
+
+    #[test]
+    fn last_quick_contact_wins_when_pointer_id_is_reused_twice() {
+        let samples = [
+            input_sample(7, TouchPhase::Started, -0.1, 1.), input_sample(7, TouchPhase::Ended, 0.1, 2.),
+            input_sample(7, TouchPhase::Started, 0.2, 3.), input_sample(7, TouchPhase::Ended, 0.2, 4.),
+        ];
+        let clicks = [input_sample(7, TouchPhase::Started, 0.2, 4.)];
+        assert!(blocked_released_clicks(&clicks, &samples, &HashSet::new(), |p| p.x < 0.).is_empty());
+    }
+
+    #[test]
+    fn quick_contact_noise_checks_do_not_disable_another_finger() {
+        let samples = [
+            input_sample(7, TouchPhase::Started, -0.1, 1.), input_sample(8, TouchPhase::Started, 0.2, 1.),
+            input_sample(7, TouchPhase::Ended, 0.1, 2.), input_sample(8, TouchPhase::Ended, 0.2, 2.),
+        ];
+        let clicks = [input_sample(7, TouchPhase::Started, 0.1, 2.), input_sample(8, TouchPhase::Started, 0.2, 2.)];
+        assert_eq!(blocked_released_clicks(&clicks, &samples, &HashSet::new(), |p| p.x < 0.), HashSet::from([7]));
+    }
+
+    #[test]
+    fn latest_terminal_position_is_checked_even_without_raw_up() {
+        let samples = [input_sample(7, TouchPhase::Started, 0.1, 1.)];
+        let clicks = [input_sample(7, TouchPhase::Started, -0.1, 2.)];
+        assert_eq!(blocked_released_clicks(&clicks, &samples, &HashSet::new(), |p| p.x < 0.), HashSet::from([7]));
+    }
+
+    #[test]
+    fn ordinary_quick_click_outside_noise_is_preserved() {
+        let samples = [input_sample(7, TouchPhase::Started, 0.1, 1.), input_sample(7, TouchPhase::Ended, 0.2, 2.)];
+        let clicks = [input_sample(7, TouchPhase::Started, 0.2, 2.)];
+        assert!(blocked_released_clicks(&clicks, &samples, &HashSet::new(), |p| p.x < 0.).is_empty());
+    }
+
+    #[test]
+    fn retained_noise_finger_is_reported_even_without_flick_snapshot_completion() {
+        let mut touches = HashMap::new();
+        let mut active = HashMap::from([(7, vec2(0.2, 0.))]);
+        let live = reconcile_official_fingers(&mut touches, &mut active, &mut vec![7], &mut HashMap::new(), false, None, None);
+        assert_eq!(noise_touch_positions(&touches, &HashMap::new(), &active, &live, 1.), vec![(7, vec2(1., 0.))]);
+    }
+
+    #[test]
+    fn noise_positions_use_latest_flick_map_without_duplicates_or_terminal_fallback() {
+        let passive = HashMap::from([(7, input_sample(7, TouchPhase::Moved, 0.1, 1.))]);
+        let extra = HashMap::from([(7, input_sample(7, TouchPhase::Moved, 0.2, 2.)), (8, input_sample(8, TouchPhase::Ended, 0.5, 2.))]);
+        let active = HashMap::from([(7, vec2(0.1, 0.)), (8, vec2(0.5, 0.)), (9, vec2(0.3, 0.))]);
+        let live = HashSet::from([7, 8, 9]);
+        assert_eq!(noise_touch_positions(&passive, &extra, &active, &live, 1.), vec![(7, vec2(1., 0.)), (9, vec2(1.5, 0.))]);
+    }
+
+    #[test]
+    fn noise_positions_keep_existing_aspect_and_y_mapping() {
+        let touch = Touch { id: 7, phase: TouchPhase::Moved, position: vec2(0.2, 0.4), time: 1. };
+        assert_eq!(noise_touch_positions(&HashMap::from([(7, touch)]), &HashMap::new(), &HashMap::new(), &HashSet::from([7]), 2.), vec![(7, vec2(2., -4.))]);
+    }
+
+    #[test]
+    fn raw_move_updates_old_snapshot_and_flick_velocity() {
+        let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Stationary, 0., 1.))]);
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Moved, 0.4, 2.));
+        assert_eq!(touches[&1].position, vec2(0.4, 0.));
+        let mut tracker = FlickTracker::new(380, 0., Point::new(0., 0.), true);
+        tracker.push_with_delta(1. / 60., Point::new(touches[&1].position.x, 0.), 1. / 60.);
+        assert!(tracker.flicked);
+    }
+
+    #[test]
+    fn older_move_does_not_rewind_snapshot_or_active_drag_position() {
+        let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Moved, 0.8, 3.))]);
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Moved, 0.4, 2.));
+        let mut active = HashMap::new();
+        reconcile_official_fingers(&mut touches, &mut active, &mut Vec::new(), &mut HashMap::new(), true, None, None);
+        assert_eq!(touches[&1].position, vec2(0.8, 0.));
+        assert_eq!(active[&1], vec2(0.8, 0.));
+    }
+
+    #[test]
+    fn down_then_moves_preserve_one_click_and_latest_coordinates() {
+        let mut touches = HashMap::new();
+        for sample in [input_sample(1, TouchPhase::Started, 0., 1.), input_sample(1, TouchPhase::Moved, 0.2, 2.), input_sample(1, TouchPhase::Moved, 0.4, 3.)] {
+            merge_official_touch(&mut touches, sample);
+        }
+        assert_eq!(touches[&1].phase, TouchPhase::Started);
+        assert_eq!(touches[&1].position, vec2(0.4, 0.));
+        assert_eq!(touches.len(), 1);
+    }
+
+    #[test]
+    fn down_replay_marks_newer_move_snapshot_as_click_without_rewinding() {
+        let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Moved, 0.4, 3.))]);
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Started, 0., 1.));
+        assert_eq!(touches[&1].phase, TouchPhase::Started);
+        assert_eq!(touches[&1].position, vec2(0.4, 0.));
+        assert_eq!(touches[&1].time, 3.);
+    }
+
+    #[test]
+    fn terminal_event_cannot_rebind_from_stale_live_snapshot() {
+        for phase in [TouchPhase::Ended, TouchPhase::Cancelled] {
+            let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Moved, 0.4, 1.))]);
+            let mut active = HashMap::from([(1, vec2(0.4, 0.)), (2, vec2(0.8, 0.))]);
+            let mut order = vec![1, 2];
+            let mut trackers = HashMap::from([(1, FlickTracker::new(380, 0., Point::new(0.4, 0.), true)), (2, FlickTracker::new(380, 0., Point::new(0.8, 0.), true))]);
+            merge_official_touch(&mut touches, input_sample(1, phase, 0.5, 2.));
+            let live = reconcile_official_fingers(&mut touches, &mut active, &mut order, &mut trackers, true, None, None);
+            assert_eq!(live, HashSet::from([2]));
+            assert_eq!(order, vec![2]);
+            assert!(!trackers.contains_key(&1));
+            assert!(trackers.contains_key(&2));
+            assert_eq!(touches[&1].phase, phase);
+            assert_eq!(touches[&2].phase, TouchPhase::Stationary);
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_is_not_overwritten_by_older_down_or_move() {
+        let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Ended, 0.4, 3.))]);
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Started, 0., 1.));
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Moved, 0.2, 2.));
+        assert_eq!(touches[&1].phase, TouchPhase::Ended);
+        assert_eq!(touches[&1].time, 3.);
+    }
+
+    #[test]
+    fn same_frame_down_move_up_leaves_no_live_finger() {
+        let mut touches = HashMap::new();
+        for sample in [input_sample(1, TouchPhase::Started, 0., 1.), input_sample(1, TouchPhase::Moved, 0.4, 2.), input_sample(1, TouchPhase::Ended, 0.4, 3.)] {
+            merge_official_touch(&mut touches, sample);
+        }
+        let mut active = HashMap::new();
+        let live = reconcile_official_fingers(&mut touches, &mut active, &mut Vec::new(), &mut HashMap::new(), true, None, None);
+        assert!(live.is_empty());
+        assert!(active.is_empty());
+        assert_eq!(touches[&1].phase, TouchPhase::Ended);
+        let clicks = released_frame_clicks(&touches, &HashSet::from([1]));
+        assert_eq!(clicks.len(), 1);
+        assert_eq!(clicks[0].phase, TouchPhase::Started);
+        assert_eq!(clicks[0].position, vec2(0.4, 0.));
+        assert_eq!(clicks[0].time, 3.);
+    }
+
+    #[test]
+    fn terminal_snapshot_without_down_does_not_create_a_click() {
+        let touches = HashMap::from([(1, input_sample(1, TouchPhase::Ended, 0.4, 3.))]);
+        assert!(released_frame_clicks(&touches, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn released_quick_click_hits_tap_without_inventing_drag_or_flick_contact() {
+        let touches = HashMap::from([(1, input_sample(1, TouchPhase::Ended, 0., 1.))]);
+        let clicks = released_frame_clicks(&touches, &HashSet::from([1]));
+        let fingers = [replica::Finger {
+            click: clicks[0].phase == TouchPhase::Started,
+            flick: false,
+            positions: vec![Some([0., 0.])],
+        }];
+        for kind in [replica::Kind::Tap, replica::Kind::Drag, replica::Kind::Flick] {
+            let mut judge = replica::Judge::new(vec![replica::Note::new(0, 0, 0., 0., kind)]);
+            let result = judge.step(replica::Frame {
+                now: 0., speed: 1.,
+                windows: replica::Windows { perfect: 0.08, good: 0.16, bad: 0.18, flick: 0.14 },
+                fingers: &fingers, held_positions: &[], keyboard_clicks: 0,
+                keyboard_held: false, fullscreen: false, interval_multiplier: 1.,
+            });
+            if kind == replica::Kind::Tap {
+                assert!(matches!(result.events.as_slice(), [replica::Event::Final { outcome: replica::Outcome::Perfect, .. }]));
+            } else {
+                assert!(result.events.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reused_pointer_with_live_down_does_not_duplicate_click() {
+        let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Ended, 0.4, 1.))]);
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Started, 0.7, 2.));
+        assert!(released_frame_clicks(&touches, &HashSet::from([1])).is_empty());
+        assert_eq!(touches[&1].phase, TouchPhase::Started);
+    }
+
+    #[test]
+    fn pointer_id_reuse_starts_a_new_contact() {
+        let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Ended, 0.9, 1.))]);
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Started, -0.7, 2.));
+        merge_official_touch(&mut touches, input_sample(1, TouchPhase::Moved, -0.5, 3.));
+        let mut active = HashMap::new();
+        let mut order = Vec::new();
+        let live = reconcile_official_fingers(&mut touches, &mut active, &mut order, &mut HashMap::new(), true, None, None);
+        assert_eq!(live, HashSet::from([1]));
+        assert_eq!(touches[&1].phase, TouchPhase::Started);
+        assert_eq!(active[&1], vec2(-0.5, 0.));
+    }
+
+    #[test]
+    fn raw_mouse_move_replaces_untimed_snapshot() {
+        let mut touches = HashMap::from([(u64::MAX, input_sample(u64::MAX, TouchPhase::Started, 0., f64::NEG_INFINITY))]);
+        merge_official_touch(&mut touches, input_sample(u64::MAX, TouchPhase::Moved, 0.4, f64::NEG_INFINITY));
+        assert_eq!(touches[&u64::MAX].position, vec2(0.4, 0.));
+        assert_eq!(touches[&u64::MAX].phase, TouchPhase::Started);
+    }
+
+    #[test]
+    fn mixed_flick_completion_does_not_add_to_passive_phira_touches() {
+        let passive = HashMap::from([(2, input_sample(2, TouchPhase::Moved, 0.1, 1.))]);
+        let mut flick_touches = passive.clone();
+        let mut active = HashMap::from([(1, vec2(0.4, 0.))]);
+        merge_official_touch(&mut flick_touches, input_sample(2, TouchPhase::Moved, 0.7, 2.));
+        reconcile_official_fingers(&mut flick_touches, &mut active, &mut Vec::new(), &mut HashMap::new(), true, None, None);
+        assert!(!passive.contains_key(&1));
+        assert_eq!(passive[&2].position, vec2(0.1, 0.));
+        assert_eq!(flick_touches[&1].phase, TouchPhase::Stationary);
+        assert_eq!(flick_touches[&2].position, vec2(0.7, 0.));
+    }
+
+    #[test]
+    fn custom_stationary_completion_clears_continuous_flick_speed() {
+        let mut tracker = FlickTracker::new_with_trigger_threshold(380, 0., Point::new(0., 0.), true, Some(0.5));
+        tracker.push_with_delta(1. / 60., Point::new(0.6, 0.), 1. / 60.);
+        assert!(tracker.continuous_flick_active());
+        tracker.consume();
+        let mut trackers = HashMap::from([(1, tracker)]);
+        let mut active = HashMap::from([(1, vec2(0.6, 0.))]);
+        let mut touches = HashMap::new();
+        reconcile_official_fingers(&mut touches, &mut active, &mut vec![1], &mut trackers, true, None, None);
+        let tracker = trackers.get_mut(&1).unwrap();
+        tracker.push_with_delta(2. / 60., Point::new(touches[&1].position.x, 0.), 1. / 60.);
+        assert!(!tracker.continuous_flick_active());
+        assert!(tracker.stopped);
+        tracker.push_with_delta(3. / 60., Point::new(1.2, 0.), 1. / 60.);
+        assert!(tracker.flicked);
+    }
+
+    #[test]
+    fn terminal_snapshot_alone_removes_tracker_without_dropping_other_fingers() {
+        let mut active = HashMap::from([(1, vec2(0., 0.)), (2, vec2(0.1, 0.))]);
+        let mut touches = HashMap::from([(1, input_sample(1, TouchPhase::Cancelled, 0., 1.))]);
+        let mut trackers = HashMap::from([(1, FlickTracker::new(380, 0., Point::new(0., 0.), true))]);
+        let mut order = vec![1, 2];
+        let mut removed = Vec::new();
+        reconcile_official_fingers(&mut touches, &mut active, &mut order, &mut trackers, true, Some(&mut removed), None);
+        assert_eq!(removed, vec![1]);
+        assert_eq!(order, vec![2]);
+        assert!(!active.contains_key(&1));
+        assert!(active.contains_key(&2));
     }
 
     #[test]

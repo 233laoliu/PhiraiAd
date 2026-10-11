@@ -403,6 +403,15 @@ impl NoiseAreaState {
     pub fn clear(&mut self) {
         *self = Self::default();
     }
+    /// A terminal event (or a new Down) ends only this pointer's old contact.
+    /// Pointer IDs may be reused before the next frame snapshot is collected.
+    pub fn release_finger(&mut self, id: u64) {
+        self.blocked_ids.remove(&id);
+        for hover in self.hovers.iter_mut().filter(|hover| hover.finger == Some(id)) {
+            hover.finger = None;
+            hover.animate(0., false);
+        }
+    }
     pub fn update(&mut self, areas: &[BlockArea], touches: &[(u64, Vec2)], t: f32, aspect: f32, enabled: bool, dt: f32) {
         if !enabled {
             self.clear();
@@ -441,6 +450,65 @@ impl NoiseAreaState {
     }
     pub fn is_blocked(&self, id: u64) -> bool {
         self.blocked_ids.contains(&id)
+    }
+}
+
+#[cfg(test)]
+mod contact_tests {
+    use super::*;
+
+    #[test]
+    fn release_clears_only_one_finger_and_its_hover() {
+        let mut state = NoiseAreaState::default();
+        state.blocked_ids.extend([7, 8]);
+        state.hovers[0].finger = Some(7);
+        state.hovers[0].scale = 11.5;
+        state.hovers[1].finger = Some(8);
+        state.hovers[1].scale = 9.;
+        state.release_finger(7);
+        assert!(!state.is_blocked(7));
+        assert!(state.is_blocked(8));
+        assert_eq!(state.hovers[0].finger, None);
+        assert_eq!(state.hovers[0].target, 0.);
+        assert_eq!(state.hovers[1].finger, Some(8));
+        assert_eq!(state.hovers[1].scale, 9.);
+    }
+
+    #[test]
+    fn reused_pointer_outside_area_is_not_blocked_by_its_previous_contact() {
+        let mut state = NoiseAreaState::default();
+        state.blocked_ids.insert(7);
+        state.release_finger(7);
+        state.update(&[], &[(7, Vec2::default())], 0., 1., true, 0.016);
+        assert!(!state.is_blocked(7));
+    }
+
+    #[test]
+    fn releasing_unknown_pointer_does_not_drop_other_noise_contacts() {
+        let mut state = NoiseAreaState::default();
+        state.blocked_ids.insert(7);
+        state.release_finger(100);
+        assert!(state.is_blocked(7));
+    }
+
+    #[test]
+    fn explicit_clear_still_clears_all_noise_contacts() {
+        let mut state = NoiseAreaState::default();
+        state.blocked_ids.extend([7, 8]);
+        state.hovers[0].finger = Some(7);
+        state.clear();
+        assert!(state.blocked_ids.is_empty());
+        assert!(state.hovers.iter().all(|hover| hover.finger.is_none()));
+    }
+
+    #[test]
+    fn disabling_noise_still_clears_latches_with_fingers_held() {
+        let mut state = NoiseAreaState::default();
+        state.blocked_ids.insert(7);
+        state.hovers[0].finger = Some(7);
+        state.update(&[], &[(7, Vec2::default())], 0., 1., false, 0.016);
+        assert!(state.blocked_ids.is_empty());
+        assert!(state.hovers.iter().all(|hover| hover.finger.is_none()));
     }
 }
 
