@@ -105,10 +105,23 @@ void main(){vec2 p=uv*AtlasMap.xy+AtlasMap.zw;vec4 original=texture2D(Original,u
 vec4 overlay=texture2D(Overlay,p);
 gl_FragColor=vec4(original.rgb*(1.0-overlay.a)+overlay.rgb,original.a);}"#;
 
+/// Shader sources are embedded at compile time, so their line endings follow the
+/// checkout: Windows (core.autocrlf) yields CRLF while CI yields LF. Every
+/// injection below matches a literal `\n`, so normalize first or the declaration
+/// is silently dropped and the shader fails with an undeclared identifier.
+fn lf(source: &str) -> std::borrow::Cow<'_, str> {
+    if source.contains('\r') {
+        std::borrow::Cow::Owned(source.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(source)
+    }
+}
 /// Evaluate procedural effects in canonical UVs; only intermediate framebuffer
 /// samples convert back into atlas UVs. Sprite textures remain local UVs.
 fn canvas_shader(vert: &str, frag: &str) -> (String, String) {
-    let mut frag = frag.to_owned();
+    let vert = lf(vert);
+    let vert = vert.as_ref();
+    let mut frag = lf(frag).into_owned();
     let mut changed = false;
     for name in [
         "_NoiseColorRT",
@@ -154,7 +167,7 @@ fn canvas_shader(vert: &str, frag: &str) -> (String, String) {
 /// Preserve the extracted material's brightness and procedural passes; only
 /// replace its hue when the per-cell Recorder color has an opaque alpha.
 fn recorder_shader(source: &str) -> String {
-    let mut source = source.to_owned();
+    let mut source = lf(source).into_owned();
     for name in ["_FillColor", "_EdgeColor", "_GlowColor", "_SparkTint", "_NoiseTint", "_TouchGlowColor"] {
         let old = format!("{name}.xyz");
         let new = format!("mix({old}, recorderTint.rgb * max(max({name}.x,{name}.y),{name}.z), recorderTint.a)");
@@ -210,7 +223,7 @@ fn compose_textures<T: Copy>(normal: T, subtract: T, displacement: Option<T>) ->
 }
 // Specialize only uniform conditions; coordinates, noise and blend math remain unchanged.
 fn active_variant(no_touch: bool, no_distortion: bool, low: bool, ready_only: bool) -> String {
-    let shader = include_str!("shaders/ActiveBlock_program_0.glsl");
+    let shader = lf(include_str!("shaders/ActiveBlock_program_0.glsl"));
     let (declarations, body) = shader.split_once("void main()").unwrap();
     let mut body = body.to_owned();
     if no_touch {
@@ -1894,6 +1907,24 @@ mod tests {
             let re = regex::Regex::new(r"uniform\s+(?:(?:mediump|highp|lowp)\s+)?sampler2D").unwrap();
             assert!(re.find_iter(&mapped).count() <= 8);
         }
+    }
+    #[test]
+    fn shaders_tolerate_windows_line_endings() {
+        let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+        for source in [
+            include_str!("shaders/DisabledBlock_program_0.glsl"),
+            include_str!("shaders/ActiveBlock_program_0.glsl"),
+        ] {
+            let shader = recorder_shader(&crlf(source));
+            // The Recorder tint declaration must survive the CRLF rewrite,
+            // otherwise the compiled shader reports an undeclared identifier.
+            assert!(shader.contains("void main()\n{\nvec4 recorderTint = texture2D(_NoiseColorRT,vs_TEXCOORD0.xy);"));
+            assert_eq!(shader, recorder_shader(source));
+        }
+        let variant = active_variant(true, true, false, false);
+        assert_eq!(recorder_shader(&crlf(&variant)), recorder_shader(&variant));
+        let (vert, frag) = (include_str!("shaders/ActiveBlock_program_0.vert"), include_str!("shaders/ActiveBlock_program_0.glsl"));
+        assert_eq!(canvas_shader(&crlf(vert), &recorder_shader(&crlf(frag))), canvas_shader(vert, &recorder_shader(frag)));
     }
     #[test]
     fn native_overlay_only_runs_for_scaled_practice() {

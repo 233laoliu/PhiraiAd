@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shader sources are embedded byte-for-byte with include_str! and patched by
+# literal patterns. Keep them LF on every checkout so a Windows build compiles
+# the same shader the Linux CI does.
+prpr/src/noise_area/shaders/** text eol=lf
